@@ -3,26 +3,42 @@ import { Link } from 'react-router-dom';
 import {
     UserSearch, Users, RefreshCw, ChevronRight, AlertTriangle,
     CheckCircle, X, UserPlus, Camera, Clock, Hash, History,
-    Undo2, Unlink, ImageIcon,
+    Undo2, Unlink, ImageIcon, Layers, Pencil, GitMerge, Archive, ArrowRightLeft,
 } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 import { supabase, getPublicUrl } from '../services/supabase';
 import { useAuth } from '../hooks/useAuth';
-import { getDetectionDisplayName } from '../utils/faceDisplay';
+import {
+    buildProfileLabelMap,
+    getProfileDisplayName,
+    getDetectionTitle,
+    getDetectionSubtitle,
+} from '../utils/faceDisplay';
+import UnknownProfilePanel from '../components/Identity/UnknownProfilePanel';
 
 const EVENT_FACE_SELECT = `
   id, classification, match_score, resident_id, unknown_profile_id, camera_event_id,
   camera_events(id, snapshot_path, created_at, event_id),
-  residents(name)
+  residents(name),
+  unknown_face_profiles(id, display_label, sighting_count, first_seen_at, status)
 `;
 
 const ACTION_SELECT = `
   id, action, created_at, metadata, event_face_id, to_resident_id, from_unknown_profile_id,
-  event_faces(
-    id, classification, resident_id,
-    camera_events(id, snapshot_path, created_at)
-  )
+  event_faces(id, camera_events(snapshot_path)),
+  from_profile:unknown_face_profiles!from_unknown_profile_id(id, representative_snapshot_path),
+  to_resident:residents!to_resident_id(id, name, photo_path)
 `;
+
+const ACTION_ICONS = {
+    assign_resident: Users,
+    revert_assign: Undo2,
+    unlink_from_resident: Unlink,
+    merge_profiles: GitMerge,
+    rename_profile: Pencil,
+    move_sighting: ArrowRightLeft,
+    dismiss_profile: Archive,
+};
 
 const IdentityPage = () => {
     const { isAdmin } = useAuth();
@@ -44,6 +60,8 @@ const IdentityPage = () => {
     const [galleryResidentId, setGalleryResidentId] = useState('');
     const [residentDetections, setResidentDetections] = useState([]);
     const [galleryLoading, setGalleryLoading] = useState(false);
+    const [clusterBackfillSaving, setClusterBackfillSaving] = useState(false);
+    const [clusterStatus, setClusterStatus] = useState(null);
     const [toast, setToast] = useState(null);
 
     const showToast = (msg, type = 'success') => {
@@ -56,6 +74,8 @@ const IdentityPage = () => {
         residents.forEach(r => m.set(r.id, r.name || 'Resident'));
         return m;
     }, [residents]);
+
+    const profileLabelMap = useMemo(() => buildProfileLabelMap(profiles), [profiles]);
 
     const revertedActionIds = useMemo(() => {
         const ids = new Set();
@@ -70,9 +90,9 @@ const IdentityPage = () => {
         const { data } = await supabase
             .from('face_label_actions')
             .select(ACTION_SELECT)
-            .in('action', ['assign_resident', 'revert_assign', 'unlink_from_resident'])
+            .in('action', ['assign_resident', 'revert_assign', 'unlink_from_resident', 'merge_profiles', 'rename_profile', 'move_sighting', 'dismiss_profile'])
             .order('created_at', { ascending: false })
-            .limit(40);
+            .limit(16);
         setRecentActions(data || []);
     }, []);
 
@@ -150,7 +170,7 @@ const IdentityPage = () => {
             .select(`
               id, match_distance, created_at,
               camera_events(id, snapshot_path, created_at),
-              event_faces(id, classification, match_score)
+              event_faces(id, classification, match_score, camera_event_id)
             `)
             .eq('unknown_face_profile_id', profileId)
             .order('created_at', { ascending: false })
@@ -179,6 +199,15 @@ const IdentityPage = () => {
             return score != null && score > 0.45 && score < 0.65;
         });
     }, [recentUnknowns]);
+
+    const unclusteredCount = useMemo(
+        () => recentUnknowns.filter(f => !f.unknown_profile_id).length,
+        [recentUnknowns],
+    );
+
+    const canClusterViaGateway = Boolean(
+        import.meta.env.VITE_GATEWAY_URL && import.meta.env.VITE_DEVICE_ID,
+    );
 
     const triggerBackfillIfNeeded = async (useEnrollment) => {
         if (!useEnrollment) return;
@@ -255,6 +284,61 @@ const IdentityPage = () => {
         if (galleryResidentId) await loadResidentDetections(galleryResidentId);
     };
 
+    const handleClusterBackfill = async () => {
+        const gatewayUrl = import.meta.env.VITE_GATEWAY_URL;
+        const deviceId = import.meta.env.VITE_DEVICE_ID;
+        if (!gatewayUrl || !deviceId) {
+            const msg = 'Add VITE_GATEWAY_URL and VITE_DEVICE_ID to website/client/.env, then restart npm run dev.';
+            setClusterStatus({ type: 'error', msg });
+            showToast(msg, 'error');
+            return;
+        }
+        setClusterBackfillSaving(true);
+        setClusterStatus({ type: 'loading', msg: `Calling gateway at ${gatewayUrl}…` });
+        const url = `${gatewayUrl.replace(/\/$/, '')}/api/v1/unknown/backfill-clustering?device_id=${deviceId}&limit=50`;
+        try {
+            const res = await fetch(url, { method: 'POST' });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                const detail = typeof body.detail === 'string'
+                    ? body.detail
+                    : JSON.stringify(body.detail || body.error || body);
+                const msg = res.status === 404
+                    ? `Gateway endpoint not found (404). Pull latest code on the Pi and restart uvicorn. (${detail})`
+                    : `Gateway error ${res.status}: ${detail}`;
+                setClusterStatus({ type: 'error', msg });
+                showToast(msg, 'error');
+                return;
+            }
+            const ok = body.clustered_ok ?? 0;
+            const created = body.profiles_created ?? 0;
+            const candidates = body.candidates ?? 0;
+            if (ok > 0) {
+                const msg = `Grouped ${ok} of ${candidates} detection(s) (${created} new profile(s)). Refresh complete.`;
+                setClusterStatus({ type: 'success', msg });
+                showToast(msg);
+            } else {
+                const msg = candidates > 0
+                    ? `Found ${candidates} photo(s) but could not cluster (face/embedding failed on Pi). Check uvicorn logs.`
+                    : 'No ungrouped unknown detections left to cluster.';
+                setClusterStatus({ type: 'error', msg });
+                showToast(msg, 'error');
+            }
+            await loadAll();
+        } catch (err) {
+            const isLocalhost = /localhost|127\.0\.0\.1/.test(gatewayUrl);
+            const hint = isLocalhost
+                ? ' Site runs on your laptop but gateway is usually on the Pi — set VITE_GATEWAY_URL=http://PI_LAN_IP:8000'
+                : ' Check Pi is on, uvicorn is running, and port 8000 is reachable from this PC.';
+            const msg = `${err.message || 'Could not reach gateway'}.${hint}`;
+            setClusterStatus({ type: 'error', msg });
+            showToast(msg, 'error');
+            console.error('Cluster backfill failed:', url, err);
+        } finally {
+            setClusterBackfillSaving(false);
+        }
+    };
+
     const handleUnlink = async (eventFaceId) => {
         if (!window.confirm('Mark this detection as unknown? The resident enrollment photo will not change.')) {
             return;
@@ -279,6 +363,26 @@ const IdentityPage = () => {
         if (galleryResidentId) await loadResidentDetections(galleryResidentId);
     };
 
+    const handleProfileRefresh = async (selectProfileId) => {
+        await loadAll();
+        if (selectProfileId) {
+            setSelectedProfileId(selectProfileId);
+            await loadSightings(selectProfileId);
+        } else {
+            setSelectedProfileId(null);
+            setSightings([]);
+        }
+    };
+
+    const handleAssignFromEventFace = async (eventFaceId) => {
+        const { data } = await supabase
+            .from('event_faces')
+            .select(EVENT_FACE_SELECT)
+            .eq('id', eventFaceId)
+            .single();
+        if (data) setAssignTarget(data);
+    };
+
     const actionLabel = (action) => {
         if (action.action === 'assign_resident') {
             const name = residentNameById.get(action.to_resident_id) || 'resident';
@@ -289,12 +393,38 @@ const IdentityPage = () => {
             const name = residentNameById.get(action.to_resident_id) || 'resident';
             return `Unlinked from ${name}`;
         }
+        if (action.action === 'merge_profiles') return 'Merged visitor profiles';
+        if (action.action === 'rename_profile') return 'Renamed visitor';
+        if (action.action === 'move_sighting') return 'Moved / ungrouped photo';
+        if (action.action === 'dismiss_profile') return 'Dismissed visitor profile';
         return action.action;
     };
 
-    const actionSnapshotPath = (action) =>
-        action.metadata?.snapshot_path
-        || action.event_faces?.camera_events?.snapshot_path;
+    const profileSnapshotById = useMemo(() => {
+        const m = new Map();
+        profiles.forEach(p => {
+            if (p.representative_snapshot_path) m.set(p.id, p.representative_snapshot_path);
+        });
+        return m;
+    }, [profiles]);
+
+    const actionSnapshotPath = (action) => {
+        const meta = action.metadata || {};
+        const eventSnap = action.event_faces?.camera_events?.snapshot_path;
+        if (eventSnap) return eventSnap;
+        if (meta.snapshot_path) return meta.snapshot_path;
+        if (action.from_profile?.representative_snapshot_path) {
+            return action.from_profile.representative_snapshot_path;
+        }
+        if (meta.target_profile_id && profileSnapshotById.has(meta.target_profile_id)) {
+            return profileSnapshotById.get(meta.target_profile_id);
+        }
+        if (action.from_unknown_profile_id && profileSnapshotById.has(action.from_unknown_profile_id)) {
+            return profileSnapshotById.get(action.from_unknown_profile_id);
+        }
+        if (action.to_resident?.photo_path) return action.to_resident.photo_path;
+        return null;
+    };
 
     if (loading) {
         return (
@@ -350,64 +480,91 @@ const IdentityPage = () => {
             )}
 
             {isAdmin && recentActions.length > 0 && (
-                <div className="card" style={{ marginBottom: 'var(--s5)', padding: 0, overflow: 'hidden' }}>
-                    <div style={{ padding: 'var(--s4) var(--s5)', borderBottom: '1px solid var(--border-dim)', background: 'var(--bg-raised)', display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div className="card" style={{ marginBottom: 'var(--s5)', padding: 'var(--s4) var(--s5)' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 'var(--s3)' }}>
                         <History size={16} style={{ color: 'var(--cyan-core)' }} />
                         <span style={{ fontWeight: 700, fontSize: 'var(--size-sm)' }}>Recent manual corrections</span>
+                        <span style={{ fontSize: 'var(--size-xxs)', color: 'var(--text-muted)' }}>{recentActions.length}</span>
                     </div>
-                    <div style={{ maxHeight: 280, overflowY: 'auto' }}>
+                    <div style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))',
+                        gap: 'var(--s3)',
+                        maxHeight: 220,
+                        overflowY: 'auto',
+                    }}>
                         {recentActions.map(action => {
                             const snap = actionSnapshotPath(action);
                             const url = snap ? getPublicUrl('event-snapshots', snap) : null;
                             const canRevert = action.action === 'assign_resident' && !revertedActionIds.has(action.id);
                             const isReverted = action.action === 'assign_resident' && revertedActionIds.has(action.id);
+                            const ActionIcon = ACTION_ICONS[action.action] || History;
                             return (
                                 <div
                                     key={action.id}
                                     style={{
-                                        display: 'flex', alignItems: 'center', gap: 'var(--s3)',
-                                        padding: 'var(--s3) var(--s5)', borderBottom: '1px solid var(--border-dim)',
-                                        opacity: isReverted ? 0.55 : 1,
+                                        display: 'flex',
+                                        gap: 'var(--s3)',
+                                        padding: 'var(--s3)',
+                                        borderRadius: 'var(--r-lg)',
+                                        border: '1px solid var(--border-soft)',
+                                        background: 'var(--bg-raised)',
+                                        opacity: isReverted ? 0.6 : 1,
                                     }}
                                 >
-                                    <div style={{ width: 40, height: 40, borderRadius: 'var(--r-md)', overflow: 'hidden', flexShrink: 0, background: 'var(--bg-base)' }}>
-                                        {url && <img src={url} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />}
+                                    <div style={{
+                                        width: 48, height: 48, borderRadius: 'var(--r-md)', overflow: 'hidden', flexShrink: 0,
+                                        background: url ? '#0a0c10' : 'linear-gradient(135deg, rgba(155,89,255,0.15), rgba(0,229,160,0.08))',
+                                        border: '1px solid var(--border-dim)',
+                                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                    }}>
+                                        {url ? (
+                                            <img src={url} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                                        ) : (
+                                            <ActionIcon size={18} style={{ color: 'var(--violet-core)', opacity: 0.85 }} />
+                                        )}
                                     </div>
                                     <div style={{ flex: 1, minWidth: 0 }}>
-                                        <div style={{ fontWeight: 600, fontSize: 'var(--size-sm)' }}>{actionLabel(action)}</div>
-                                        <div style={{ fontSize: 'var(--size-xxs)', color: 'var(--text-muted)' }}>
+                                        <div style={{
+                                            fontWeight: 600, fontSize: 'var(--size-xs)', lineHeight: 1.35,
+                                            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                                        }}>
+                                            {actionLabel(action)}
+                                        </div>
+                                        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
                                             {action.created_at
                                                 ? formatDistanceToNow(new Date(action.created_at), { addSuffix: true })
                                                 : '—'}
-                                            {action.metadata?.enrollment_updated && ' · enrollment photo updated'}
+                                            {action.metadata?.enrollment_updated && ' · enrollment updated'}
                                             {isReverted && ' · reverted'}
                                         </div>
+                                        {(canRevert || action.event_face_id) && (
+                                            <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
+                                                {canRevert && (
+                                                    <button
+                                                        type="button"
+                                                        className="btn btn-ghost btn-sm"
+                                                        disabled={revertSavingId === action.id}
+                                                        onClick={() => handleRevert(action.id)}
+                                                        style={{ fontSize: 10, padding: '2px 6px', color: 'var(--amber-core)' }}
+                                                    >
+                                                        {revertSavingId === action.id ? '…' : 'Revert'}
+                                                    </button>
+                                                )}
+                                                {action.event_face_id && (
+                                                    <Link to="/camera" className="btn btn-ghost btn-sm" style={{ fontSize: 10, padding: '2px 6px' }}>
+                                                        Camera
+                                                    </Link>
+                                                )}
+                                            </div>
+                                        )}
                                     </div>
-                                    {canRevert && (
-                                        <button
-                                            type="button"
-                                            className="btn btn-ghost btn-sm"
-                                            disabled={revertSavingId === action.id}
-                                            onClick={() => handleRevert(action.id)}
-                                            style={{ color: 'var(--amber-core)' }}
-                                        >
-                                            {revertSavingId === action.id
-                                                ? <div className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} />
-                                                : <><Undo2 size={13} /> Revert</>}
-                                        </button>
-                                    )}
-                                    {action.event_face_id && (
-                                        <Link to="/camera" className="btn btn-ghost btn-sm" style={{ fontSize: 11 }}>
-                                            <Camera size={12} />
-                                        </Link>
-                                    )}
                                 </div>
                             );
                         })}
                     </div>
                 </div>
             )}
-
             {isAdmin && (
                 <div className="card" style={{ marginBottom: 'var(--s5)', padding: 'var(--s5)' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 'var(--s4)' }}>
@@ -541,13 +698,56 @@ const IdentityPage = () => {
             <div style={{ display: 'grid', gridTemplateColumns: 'minmax(280px, 360px) 1fr', gap: 'var(--s5)', alignItems: 'start' }}>
                 <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
                     <div style={{ padding: 'var(--s4) var(--s5)', borderBottom: '1px solid var(--border-dim)', background: 'var(--bg-raised)' }}>
-                        <div style={{ fontWeight: 700, fontSize: 'var(--size-sm)' }}>Unknown visitors</div>
-                        <div style={{ fontSize: 'var(--size-xs)', color: 'var(--text-muted)' }}>{profiles.length} active profile{profiles.length !== 1 ? 's' : ''}</div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 'var(--s3)' }}>
+                            <div>
+                                <div style={{ fontWeight: 700, fontSize: 'var(--size-sm)' }}>Unknown visitors</div>
+                                <div style={{ fontSize: 'var(--size-xs)', color: 'var(--text-muted)' }}>
+                                    {profiles.length} active profile{profiles.length !== 1 ? 's' : ''}
+                                    {unclusteredCount > 0 && ` · ${unclusteredCount} ungrouped below`}
+                                </div>
+                            </div>
+                            {isAdmin && (unclusteredCount > 0 || profiles.length === 0) && (
+                                <button
+                                    type="button"
+                                    className="btn btn-ghost btn-sm"
+                                    disabled={clusterBackfillSaving || !canClusterViaGateway}
+                                    onClick={handleClusterBackfill}
+                                    title={canClusterViaGateway ? 'Group recent unknown photos by face similarity' : 'Set VITE_GATEWAY_URL and VITE_DEVICE_ID'}
+                                    style={{ fontSize: 10, whiteSpace: 'nowrap', color: 'var(--violet-core)' }}
+                                >
+                                    {clusterBackfillSaving
+                                        ? <div className="spinner" style={{ width: 12, height: 12, borderWidth: 2 }} />
+                                        : <><Layers size={12} /> Group photos</>}
+                                </button>
+                            )}
+                        </div>
+                        {clusterStatus && (
+                            <p style={{
+                                marginTop: 'var(--s3)',
+                                fontSize: 'var(--size-xxs)',
+                                lineHeight: 1.45,
+                                color: clusterStatus.type === 'success'
+                                    ? 'var(--jade-core)'
+                                    : clusterStatus.type === 'loading'
+                                        ? 'var(--cyan-core)'
+                                        : 'var(--crimson-core)',
+                            }}>
+                                {clusterStatus.msg}
+                            </p>
+                        )}
+                        {isAdmin && canClusterViaGateway && /localhost|127\.0\.0\.1/.test(import.meta.env.VITE_GATEWAY_URL || '') && (
+                            <p style={{ marginTop: 6, fontSize: 10, color: 'var(--amber-core)', lineHeight: 1.4 }}>
+                                Gateway URL is localhost — use the Pi IP in .env if the site runs on your laptop.
+                            </p>
+                        )}
                     </div>
                     <div style={{ maxHeight: 520, overflowY: 'auto' }}>
                         {profiles.length === 0 ? (
                             <div className="empty-state" style={{ padding: 'var(--s8)' }}>
-                                <p style={{ fontSize: 'var(--size-sm)', color: 'var(--text-muted)' }}>No clustered unknown profiles yet.</p>
+                                <p style={{ fontSize: 'var(--size-sm)', color: 'var(--text-muted)', lineHeight: 1.55 }}>
+                                    No clustered profiles yet. Detections below are ungrouped until the gateway clusters them
+                                    (new uploads automatically, or use <strong>Group photos</strong>).
+                                </p>
                             </div>
                         ) : profiles.map(p => {
                             const thumb = p.representative_snapshot_path
@@ -573,7 +773,7 @@ const IdentityPage = () => {
                                         {thumb ? <img src={thumb} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : <UserSearch size={20} style={{ margin: 14, color: 'var(--text-muted)' }} />}
                                     </div>
                                     <div style={{ flex: 1, minWidth: 0 }}>
-                                        <div style={{ fontWeight: 700, fontSize: 'var(--size-sm)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.display_label}</div>
+                                        <div style={{ fontWeight: 700, fontSize: 'var(--size-sm)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{getProfileDisplayName(p, profileLabelMap)}</div>
                                         <div style={{ fontSize: 'var(--size-xxs)', color: 'var(--text-muted)', marginTop: 2 }}>
                                             <Hash size={10} style={{ display: 'inline', verticalAlign: -1 }} /> {p.sighting_count} sighting{p.sighting_count !== 1 ? 's' : ''}
                                         </div>
@@ -587,46 +787,17 @@ const IdentityPage = () => {
 
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--s5)' }}>
                     {selectedProfile ? (
-                        <div className="card" style={{ padding: 'var(--s5)' }}>
-                            <div style={{ display: 'flex', gap: 'var(--s5)', flexWrap: 'wrap' }}>
-                                <div style={{
-                                    width: 140, height: 140, borderRadius: 'var(--r-xl)', overflow: 'hidden',
-                                    border: '2px solid rgba(155,89,255,0.3)', flexShrink: 0,
-                                }}>
-                                    {selectedProfile.representative_snapshot_path && (
-                                        <img
-                                            src={getPublicUrl('event-snapshots', selectedProfile.representative_snapshot_path)}
-                                            alt=""
-                                            style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-                                        />
-                                    )}
-                                </div>
-                                <div>
-                                    <h2 style={{ fontFamily: 'var(--font-display)', fontSize: 'var(--size-xl)', fontWeight: 700, marginBottom: 'var(--s2)' }}>{selectedProfile.display_label}</h2>
-                                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--s3)', fontSize: 'var(--size-xs)', color: 'var(--text-muted)' }}>
-                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><Clock size={12} /> Last seen {selectedProfile.last_seen_at ? formatDistanceToNow(new Date(selectedProfile.last_seen_at), { addSuffix: true }) : '—'}</span>
-                                        <span>{selectedProfile.sighting_count} total sightings</span>
-                                    </div>
-                                </div>
-                            </div>
-                            <h3 style={{ fontSize: 'var(--size-sm)', fontWeight: 700, marginTop: 'var(--s5)', marginBottom: 'var(--s3)' }}>Sighting timeline</h3>
-                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(100px, 1fr))', gap: 'var(--s3)' }}>
-                                {sightings.map(s => {
-                                    const path = s.camera_events?.snapshot_path;
-                                    const url = path ? getPublicUrl('event-snapshots', path) : null;
-                                    return (
-                                        <div key={s.id} style={{ borderRadius: 'var(--r-md)', overflow: 'hidden', border: '1px solid var(--border-soft)' }}>
-                                            <div style={{ aspectRatio: '1', background: '#0a0c10' }}>
-                                                {url && <img src={url} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />}
-                                            </div>
-                                            <div style={{ padding: 6, fontSize: 9, color: 'var(--text-muted)' }}>
-                                                {s.created_at ? formatDistanceToNow(new Date(s.created_at), { addSuffix: true }) : '—'}
-                                            </div>
-                                        </div>
-                                    );
-                                })}
-                            </div>
-                        </div>
+                        <UnknownProfilePanel
+                            profile={selectedProfile}
+                            labelMap={profileLabelMap}
+                            otherProfiles={profiles}
+                            sightings={sightings}
+                            residents={residents}
+                            isAdmin={isAdmin}
+                            onRefresh={handleProfileRefresh}
+                            onAssignSighting={isAdmin ? handleAssignFromEventFace : null}
+                            showToast={showToast}
+                        />
                     ) : (
                         <div className="card empty-state" style={{ padding: 'var(--s10)' }}>
                             <UserSearch size={40} style={{ color: 'var(--text-muted)', marginBottom: 'var(--s4)' }} />
@@ -659,12 +830,14 @@ const IdentityPage = () => {
                                             {url && <img src={url} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />}
                                         </div>
                                         <div style={{ flex: 1, minWidth: 0 }}>
-                                            <div style={{ fontWeight: 600, fontSize: 'var(--size-sm)', color: 'var(--crimson-core)' }}>{getDetectionDisplayName(ev)}</div>
+                                            <div style={{ fontWeight: 600, fontSize: 'var(--size-sm)', color: face.unknown_profile_id ? 'var(--violet-core)' : 'var(--text-secondary)' }}>
+                                                {getDetectionTitle(ev, profileLabelMap)}
+                                            </div>
                                             <div style={{ fontSize: 'var(--size-xxs)', color: 'var(--text-muted)' }}>
+                                                {getDetectionSubtitle(ev) && <span style={{ marginRight: 6 }}>{getDetectionSubtitle(ev)}</span>}
                                                 {face.camera_events?.created_at
                                                     ? formatDistanceToNow(new Date(face.camera_events.created_at), { addSuffix: true })
                                                     : '—'}
-                                                {face.match_score != null && ` · score ${Number(face.match_score).toFixed(2)}`}
                                             </div>
                                         </div>
                                         {isAdmin && (
