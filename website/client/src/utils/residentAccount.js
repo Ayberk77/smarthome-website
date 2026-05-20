@@ -1,7 +1,8 @@
 /** Resident row has any login record (new or legacy columns). */
 export function residentHasLoginAccount(resident) {
     if (!resident) return false;
-    return Boolean(resident.auth_user_id || resident.account_email || resident.user_id);
+    // Do not use legacy user_id — it caused false "Invite sent" badges for non-admins.
+    return Boolean(resident.auth_user_id || resident.account_email);
 }
 
 /**
@@ -28,12 +29,20 @@ export function isResidentAccountActive(authStatus) {
 
 /**
  * UI badge for login state (_authStatus from get_auth_users_status RPC).
+ * @param {object} resident
+ * @param {{ canViewAuthDetails?: boolean }} [options]
+ *   canViewAuthDetails — true for admins after attachResidentAuthStatus; false hides misleading "Invite sent".
  */
-export function getResidentAccountBadge(resident) {
+export function getResidentAccountBadge(resident, options = {}) {
+    const { canViewAuthDetails = false } = options;
     if (!residentHasLoginAccount(resident)) return null;
 
     const st = resident._authStatus;
     const email = resident.account_email;
+
+    if (!canViewAuthDetails) {
+        return null;
+    }
 
     if (st) {
         if (isTruthyFlag(st.force_password_change)) {
@@ -79,26 +88,8 @@ export function getResidentAccountBadge(resident) {
         };
     }
 
-    const authId = getResidentAuthUserId(resident);
-    if (residentHasLoginAccount(resident) && !authId) {
-        return {
-            label: 'Invite sent',
-            color: 'var(--amber-core)',
-            icon: 'mail',
-            title: email
-                ? `Login linked to ${email}. Refresh after running supabase_setup_v9 SQL.`
-                : 'Login invite recorded.',
-        };
-    }
-
-    return {
-        label: 'Invite sent',
-        color: 'var(--amber-core)',
-        icon: 'mail',
-        title: email
-            ? `Login email: ${email}. Run supabase_setup_v9 in Supabase SQL Editor, then refresh.`
-            : 'Login invite pending.',
-    };
+    // Auth status not loaded (RPC failed or skipped) — avoid misleading "Invite sent".
+    return null;
 }
 
 /** Attach _authStatus from admin RPC (no-op if no auth ids). */
